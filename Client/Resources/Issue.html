@@ -477,13 +477,13 @@ function hasUnsubmittedComment() {
                         <div class="issue-meta-wrapper">
                             {{#gravatar_id}}
                             <div class="issue-image-area">
-                                <img class="issue-author-image" src="http://www.gravatar.com/avatar/{{gravatar_id}}.png?s=68&d=identicon" alt="{{user_email}}" />
+                                <img class="issue-author-image" src="http://www.gravatar.com/avatar/{{gravatar_id}}.png?s=68&amp;d=identicon" alt="{{user_login}}" />
                                 <div class="issue-image-paperclip-placeholder"></div>
                             </div>
                             {{/gravatar_id}}
                             <div class="issue-meta-box first-box">
                                 <h3 class="issue-meta-title">Submitter</h3>
-                                <span class="issue-meta-content">{{user}}</span>
+                                <span class="issue-meta-content">{{user_login}}</span>
                             </div>
                             <div class="issue-meta-box first-box">
                                 <h3 class="issue-meta-title">Issue Number</h3>
@@ -524,9 +524,9 @@ function hasUnsubmittedComment() {
                     </div>
                     <div class="comment-meta">
                         <div class="comment-meta-wrapper">
-                            <div class="comment-author-image"><img src="http://www.gravatar.com/avatar/{{.gravatar_id}}.png?s=28&d=identicon" alt="{{.user}}" /></div>
+                            <div class="comment-author-image"><img src="http://www.gravatar.com/avatar/{{.user.gravatar_id}}.png?s=28&amp;d=identicon" alt="{{.user.login}}" /></div>
                             <div class="comment-meta-meta">
-                                <div class="comment-author">{{.user}}</div>
+                                <div class="comment-author">{{.user.login}}</div>
                                 <div class="comment-date">{{.human_readable_date}}</div>
                             </div>
                         </div>

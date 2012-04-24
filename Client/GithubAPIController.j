@@ -3,14 +3,15 @@
 @import <AppKit/CPImage.j>
 @import "md5-min.js"
 
-BASE_API = "/github/";
 BASE_URL = "https://github.com/";
-
-if (window.location && window.location.protocol === "file:")
-    BASE_API = BASE_URL + "api/v2/json/";
+BASE_API = "https://api.github.com";
 
 var SharedController = nil,
     GravatarBaseURL = "http://www.gravatar.com/avatar/";
+
+API_MAX_PER_PAGE = 100;
+API_NOTE_VALUE = "GitHub Issues";
+API_NOTE_URL = "http://githubissues.heroku.com";
 
 // Sent whenever an issue changes
 GitHubAPIIssueDidChangeNotification = @"GitHubAPIIssueDidChangeNotification";
@@ -24,6 +25,143 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
     if (![sharedController isAuthenticated])
         [sharedController promptForAuthentication:nil];
 }
+
+@implementation MultiPageRequest : CPObject
+{
+    CPString            resource;
+    int                 maxConcurrentRequests;
+    int                 activeRequests;
+    CPMutableDictionary pages;
+    int                 numberOfPages;
+    CPMutableArray      requestQueue;
+    var                 completeCallback;
+}
+
+- (id)initWithResource:(CPString)aResource maxConcurrentRequests:(int)maxRequests
+{
+    if (self = [super init])
+    {
+        resource = aResource;
+        maxConcurrentRequests = maxRequests;
+        activeRequests = 0;
+        pages = [[CPMutableDictionary alloc] init];
+        requestQueue = [[CPMutableArray alloc] init];
+    }
+
+    return self;
+}
+
+- (BOOL)isComplete
+{
+    return [pages count] === numberOfPages;
+}
+
+- (void)loadAllWithCallback:(id)aCallback
+{
+    completeCallback = aCallback;
+    var request = new CFHTTPRequest();
+    request.open("GET", resource, true);
+
+    // Get the first page to determine how many pages must be loaded
+    request.oncomplete = function()
+    {
+        if (request.success())
+        {
+            [pages setObject:JSON.parse(request.responseText()) forKey:0];
+
+            var links = request.getResponseHeader("Link");
+            if (links == null)
+            {
+                numberOfPages = 1;
+            }
+            else
+            {
+                var matches = links.match(/<[^>]*?page=(\d+)[^>]*>;\s+rel="last"/);
+                if (!matches || matches.length !== 2)
+                {
+                    throw new Error("Unable to determine number of pages for resource " + resource);
+                }
+                numberOfPages = parseInt(matches[1]);
+            }
+        }
+
+        [self queueRequests];
+        [self executeRequests];
+    };
+
+    request.send("");
+}
+
+- (void)executeRequests
+{
+    if ([self isComplete])
+    {
+        var allRecords = [[CPMutableArray alloc] init];
+        for (var i = 0, len = [pages count]; i < len; i++)
+        {
+            [allRecords addObjectsFromArray:[pages objectForKey:i]];
+        }
+        completeCallback(allRecords);
+        return;
+    }
+    for (; activeRequests < maxConcurrentRequests && [requestQueue count] > 0; activeRequests++)
+    {
+        var task = [requestQueue firstObject];
+        [requestQueue removeObjectAtIndex:0];
+        task();
+    }
+}
+
+- (void)requestCompleted
+{
+    activeRequests--;
+    [self executeRequests];
+}
+
+- (void)queueRequests
+{
+    function loadPage (pageIndex) {
+        return function()
+        {
+            var pageNumber = pageIndex + 1;
+            var url = resource;
+            if (!url.indexOf("?"))
+            {
+                url += "?page=" + pageNumber;
+            }
+            else
+            {
+                url += "&page=" + pageNumber;
+            }
+            var request = new CFHTTPRequest();
+            request.open("GET", url, true);
+
+            request.oncomplete = function ()
+            {
+                try
+                {
+                    if (request.success())
+                    {
+                        [pages setObject:JSON.parse(request.responseText()) forKey:pageIndex];
+                    }
+                } catch (e)
+                {
+                    CPLog.error("Unable to process response for " + resource + " page " + pageNumber);
+                }
+                [self requestCompleted];
+            };
+
+            request.send("");
+        };
+    };
+    // Page 1  is always loaded before this is called
+    for (var page = 1; page < numberOfPages; page++)
+    {
+        [requestQueue addObject:loadPage(page)];
+    }
+}
+
+@end
 
 @implementation GithubAPIController : CPObject
 {
@@ -81,6 +219,42 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
         [self promptForAuthentication:sender];
 }
 
+- (CPString)URLForPathComponents:(CPArray)aPath JSObjectParameters:(id)parameters
+{
+    return [self URLForPathComponents:aPath parameters:[CPDictionary dictionaryWithJSObject:parameters]];
+}
+
+- (CPString)URLForPathComponents:(CPArray)pathComponents parameters:(CPDictionary)parameters
+{
+    var path = BASE_API + "/" + [pathComponents componentsJoinedByString:"/"];
+
+    var params = [[CPMutableDictionary alloc] init];
+    if (parameters !== nil)
+    {
+        [params addEntriesFromDictionary:parameters];
+    }
+    if ([self isAuthenticated])
+    {
+        [params setObject:oauthAccessToken forKey:"access_token"];
+    }
+
+    if ([params count] > 0)
+    {
+        var paramEntries = [[CPMutableArray alloc] init];
+
+        var keyEnum = [params keyEnumerator];
+        var key = nil;
+        while ((key = [keyEnum nextObject])) {
+            var value = [params objectForKey:key];
+            [paramEntries addObject:encodeURIComponent(key) + "=" + encodeURIComponent(value)];
+        }
+
+        path += "?" + [paramEntries componentsJoinedByString:"&"];
+    }
+
+    return path;
+}
+
 - (void)logoutPrompt:(id)sender
 {
     // if we're not using OAuth it's a pain to find the
@@ -113,16 +287,85 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
 
 - (CPString)_credentialsString
 {
-    var authString = "?app_id=280issues";
+    var authString = "";
     if ([self isAuthenticated])
     {
         if (oauthAccessToken)
-            authString += "&access_token="+encodeURIComponent(oauthAccessToken);
-        else
-            authString += "&login="+encodeURIComponent(username)+"&token="+encodeURIComponent(authenticationToken);
+            authString += "access_token="+encodeURIComponent(oauthAccessToken);
     }
 
     return authString;
+}
+
+- (void)createOrLookupAccessTokenWithPassword:(CPString)password callback:(id)aCallback
+{
+    var authorizationHeader = "Basic " + CFData.encodeBase64String(username + ":" + password);
+    var listRequest = new CFHTTPRequest();
+    var createRequest = new CFHTTPRequest();
+
+    listRequest.open("GET", BASE_API + "/authorizations", true);
+    listRequest.setRequestHeader("Authorization", authorizationHeader);
+    listRequest.oncomplete = function ()
+    {
+        [self _checkGithubResponse:listRequest];
+        if (!listRequest.success())
+        {
+            CPLog.error("Failed to lookup authorizations --- " + createRequest.status());
+            aCallback(false, listRequest);
+            return;
+        }
+
+        try
+        {
+            var authorizations = JSON.parse(listRequest.responseText());
+            for (var i = 0; i < [authorizations count]; i++)
+            {
+                var auth = [authorizations objectAtIndex:i];
+                if (auth.note_url == API_NOTE_URL)
+                {
+                    oauthAccessToken = auth.token;
+                    aCallback(true);
+                    return;
+                }
+            }
+
+            // did not find an existing token
+            createRequest.open("POST", BASE_API + "/authorizations", true);
+            createRequest.setRequestHeader("Content-Type", "application/json");
+            createRequest.setRequestHeader("Authorization", authorizationHeader);
+
+            createRequest.send(JSON.stringify({scopes: ["repo"], note: API_NOTE_VALUE, note_url: API_NOTE_URL}));
+        }
+        catch (e)
+        {
+            CPLog.error("Unexpected error parsing authorizations --- " + e);
+        }
+    };
+
+    listRequest.send("");
+
+    createRequest.oncomplete = function ()
+    {
+        [self _checkGithubResponse:createRequest];
+        if (!createRequest.success())
+        {
+            CPLog.error("Failed to create authorizations --- " + createRequest.status());
+            aCallback(false, createRequest);
+            return;
+        }
+
+        try
+        {
+            var auth = JSON.parse(createRequest.responseText());
+            oauthAccessToken = auth.token;
+
+            aCallback(true, createRequest);
+        }
+        catch (e)
+        {
+            CPLog.error("Unexpected error parsing create authorization response --- " + e);
+        }
+    };
 }
 
 - (void)authenticateWithCallback:(Function)aCallback
@@ -130,15 +373,13 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
     var request = new CFHTTPRequest();
 
     if (oauthAccessToken)
-        request.open("GET", BASE_API + "user/show?access_token=" + encodeURIComponent(oauthAccessToken), true);
-    else
-        request.open("GET", BASE_API + "user/show?login=" + encodeURIComponent(username) + "&token=" + encodeURIComponent(authenticationToken), true);
+        request.open("GET", BASE_API + "/user?access_token=" + encodeURIComponent(oauthAccessToken), true);
 
     request.oncomplete = function()
     {
         if (request.success())
         {
-            var response = JSON.parse(request.responseText()).user;
+            var response = JSON.parse(request.responseText());
 
             username = response.login;
             emailAddress = response.email;
@@ -182,14 +423,8 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
 
 - (void)promptForAuthentication:(id)sender
 {
-    // because oauth relies on the server and multiple windows
-    if ([CPPlatform isBrowser] && [CPPlatformWindow supportsMultipleInstances] && BASE_API === "/github/")
-        loginController = [[OAuthController alloc] init];
-    else
-    {
-        var loginWindow = [LoginWindow sharedLoginWindow];
-        [loginWindow makeKeyAndOrderFront:self];
-    }
+    var loginWindow = [LoginWindow sharedLoginWindow];
+    [loginWindow makeKeyAndOrderFront:self];
 }
 
 - (CPDictionary)repositoryForIdentifier:(CPString)anIdentifier
@@ -204,15 +439,16 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
         anIdentifier = parts.slice(0, 2).join("/");
 
     var request = new CFHTTPRequest();
-    request.open("GET", BASE_API+"repos/show/"+anIdentifier+[self _credentialsString], true);
+    request.open("GET", [self URLForPathComponents:["repos", anIdentifier] parameters:nil], true);
 
     request.oncomplete = function()
     {
+        [self _checkGithubResponse:request];
         var repo = nil;
         if (request.success())
         {
             try {
-                repo = JSON.parse(request.responseText()).repository;
+                repo = JSON.parse(request.responseText());
                 repo.identifier = anIdentifier;
 
                 [repositoriesByIdentifier setObject:repo forKey:anIdentifier];
@@ -228,7 +464,6 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
         if (repo)
         {
             [self loadLabelsForRepository:repo];
-            [self loadPullRequestsForRepository:repo];
         }
 
         [[CPRunLoop currentRunLoop] performSelectors];
@@ -237,148 +472,92 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
     request.send("");
 }
 
+- (void)loadIssuesInState:(CPString)state forRepository:(Repository)aRepo callback:(id)aCallback
+{
+    if (state !== "open" && state !== "closed")
+    {
+        CPLog.error("Invalid issue state " + state);
+        aCallback(false, issues);
+        return;
+    }
+    var issuesRequest = [[MultiPageRequest alloc] initWithResource:[self URLForPathComponents:["repos", aRepo.identifier, "issues"]
+                                                                           JSObjectParameters:{"state": state, "per_page": API_MAX_PER_PAGE}]
+                                             maxConcurrentRequests:3];
+
+    [issuesRequest loadAllWithCallback:function (rawIssues)
+    {
+        var issues = [CPArray arrayWithJSArray:rawIssues recursively:YES];
+
+        for (var i = 0, count = [issues count]; i < count; i++)
+        {
+            var issue = issues[i];
+            [issue setObject:([issue valueForKeyPath:"pull_request.html_url"] !== [CPNull null]) forKey:"has_pull_request"];
+        }
+
+        if (state === "open")
+        {
+            aRepo.openIssues = issues;
+        }
+        else if (state === "closed")
+        {
+            aRepo.closedIssues = issues;
+        }
+
+        [self _noteRepoChanged:aRepo];
+
+        if (aCallback)
+        {
+            aCallback(true, issues);
+        }
+    }];
+}
+
 - (void)loadIssuesForRepository:(Repository)aRepo callback:(id)aCallback
 {
     var openIssuesLoaded = NO,
+        openIssuesSuccess = NO,
         closedIssuesLoaded = NO,
-        pullRequestsLoaded = NO,
+        closedIssuesSuccess = NO,
         waitForAll = function () {
-            if (!openIssuesLoaded || !closedIssuesLoaded || !pullRequestsLoaded)
+            if (!openIssuesLoaded || !closedIssuesLoaded)
                 return;
 
-            // Now, for sorting purposes each issue should know if it has a pull request
-            var c = [aRepo.openIssues count];
-            while (c--)
-            {
-                var issue = aRepo.openIssues[c];
-                [issue setValue:([issue objectForKey:"number"] in aRepo.pullRequests) forKey:"has_pull_request"];
-            }
-
             if (aCallback)
-                aCallback(openRequest.success() && closedRequest.success(), aRepo, openRequest, closedRequest);
+                aCallback(openIssuesSuccess && closedIssuesSuccess, aRepo);
 
             [[CPRunLoop currentRunLoop] performSelectors];
         };
 
-    var openRequest = new CFHTTPRequest();
-    openRequest.open("GET", BASE_API+"issues/list/"+aRepo.identifier+"/open"+[self _credentialsString], true);
-
-    openRequest.oncomplete = function() {
-        if (openRequest.success())
-        {
-            try
-            {
-                var issues = [[CPDictionary dictionaryWithJSObject:JSON.parse(openRequest.responseText()) recursively:YES] objectForKey:"issues"];
-
-                [self _noteRepoChanged:aRepo];
-
-                aRepo.openIssues = issues;
-
-                var maxPosition = 0,
-                    minPosition = Infinity;
-                for (var i = 0, count = [issues count]; i < count; i++)
-                {
-                    maxPosition = MAX([issues[i] objectForKey:"position"], maxPosition);
-                    minPosition = MIN([issues[i] objectForKey:"position"], minPosition);
-                }
-
-                aRepo.openIssuesMax = maxPosition;
-                aRepo.openIssuesMin = minPosition;
-            }
-            catch (e)
-            {
-                CPLog.error("Unable to load issues for repo: "+aRepo+" -- "+e);
-            }
-        }
-
-        openIssuesLoaded = YES;
-        waitForAll();
-    }
-
-    var closedRequest = new CFHTTPRequest();
-    closedRequest.open("GET", BASE_API + "issues/list/" + aRepo.identifier + "/closed" + [self _credentialsString], true);
-
-    closedRequest.oncomplete = function() {
-        if (closedRequest.success())
-        {
-            try
-            {
-                var issues = [[CPDictionary dictionaryWithJSObject:JSON.parse(closedRequest.responseText()) recursively:YES] objectForKey:"issues"];
-                aRepo.closedIssues = issues;
-
-                var maxPosition = 0,
-                    minPosition = Infinity;
-                for (var i = 0, count = [issues count]; i < count; i++)
-                {
-                    maxPosition = MAX([issues[i] objectForKey:"position"], maxPosition);
-                    minPosition = MIN([issues[i] objectForKey:"position"], minPosition);
-                }
-
-                aRepo.closedIssuesMax = maxPosition;
-                aRepo.closedIssuesMin = minPosition;
-            }
-            catch (e)
-            {
-                CPLog.error("Unable to load repositority with identifier: " + anIdentifier + " -- " + e);
-            }
-        }
-
-        closedIssuesLoaded = YES;
-        waitForAll();
-    }
-
-    // FIX ME: perhaps we should consider doing something with the closed requests too?
-    var pullRequestsRequest = new CFHTTPRequest();
-    pullRequestsRequest.open("GET", BASE_API + "pulls/"+ aRepo.identifier +"/open/" + [self _credentialsString], true);
-    pullRequestsRequest.oncomplete = function()
+    [self loadIssuesInState:"open" forRepository:aRepo callback:function (wasSuccessful, issues)
     {
-        if (pullRequestsRequest.success())
-        {
-            var requests;
+        openIssuesLoaded = YES;
+        openIssuesSuccess = wasSuccessful;
 
-            try
-            {
-                requests = JSON.parse(pullRequestsRequest.responseText()).pulls || [];
-            }
-            catch (e)
-            {
-                CPLog.error(@"Unable to load pull requests for repo: " + aRepo + @" -- " + e);
-                requests = [];
-            }
-        }
-        else
-            requests = [];
-
-        // Cache the numbers fo a much faster lookup by hashing the issue number.
-        var c = [requests count];
-        aRepo.pullRequests = { };
-        while (c--)
-        {
-            var pull = requests[c];
-            aRepo.pullRequests[pull.number] = pull;
-        }
-
-        pullRequestsLoaded = YES;
         waitForAll();
-    }
+    }];
 
-    pullRequestsRequest.send("");
-    openRequest.send("");
-    closedRequest.send("");
+    [self loadIssuesInState:"closed" forRepository:aRepo callback:function (wasSuccessful, issues)
+    {
+        closedIssuesLoaded = YES;
+        closedIssuesSuccess = wasSuccessful;
+
+        waitForAll();
+    }];
 }
 
 - (void)loadCommentsForIssue:(Issue)anIssue repository:(Repository)aRepo callback:(Function)aCallback
 {
     var request = new CFHTTPRequest();
-    request.open("GET", BASE_API+"issues/comments/"+aRepo.identifier+"/"+[anIssue objectForKey:"number"]+[self _credentialsString], true);
+    request.open("GET", [self URLForPathComponents:["repos", aRepo.identifier, "issues", [anIssue objectForKey:"number"], "comments"] parameters:nil], true);
 
     request.oncomplete = function()
     {
+        [self _checkGithubResponse:request];
         var comments = [];
         if (request.success())
         {
             try {
-                comments = JSON.parse(request.responseText()).comments || [];
+                comments = JSON.parse(request.responseText());
             }
             catch (e) {
                 CPLog.error("Unable to load comments for issue: "+anIssue+" -- "+e);
@@ -396,29 +575,24 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
     request.send("");
 }
 
-- (void)loadPullRequestsForRepository:(Repository)aRepo
-{
-
-
-}
-
 - (void)loadLabelsForRepository:(Repository)aRepo
 {
     var request = new CFHTTPRequest();
-    request.open(@"GET", [CPString stringWithFormat:@"%@issues/labels/%@/%@", BASE_API, aRepo.identifier, [self _credentialsString]], YES);
+    request.open(@"GET", [self URLForPathComponents:["repos", aRepo.identifier, "labels"] parameters:nil], YES);
 
     request.oncomplete = function()
     {
+        [self _checkGithubResponse:request];
         var labels = [];
         if (request.success())
         {
             try
             {
-                labels = JSON.parse(request.responseText()).labels || [];
+                labels = [CPArray arrayWithJSArray:(JSON.parse(request.responseText()) || []) recursively:YES];
             }
             catch (e)
             {
-                CPLog.error(@"Unable to load labels for issue: " + anIssue + @" -- " + e);
+                CPLog.error(@"Unable to load labels for repository: " + aRepo.identifier + @" -- " + e);
             }
         }
 
@@ -429,46 +603,102 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
     request.send(@"");
 }
 
+- (void)createLabel:(CPString)aLabel withColor:(CPColor)aColor repository:(Repository)aRepo callback:(id)callback
+{
+    var existingLabels = [aRepo.labels valueForKeyPath:"name"];
+    if ([existingLabels containsObject:aLabel])
+    {
+        callback(true);
+        return;
+    }
+
+    var request = new CFHTTPRequest();
+    request.open("POST", [self URLForPathComponents:["repos", aRepo.identifier, "labels"] parameters:nil], true);
+
+    request.oncomplete = function ()
+    {
+        [self _checkGithubResponse:request];
+        if (request.success())
+        {
+            try
+            {
+                var label = [CPDictionary dictionaryWithJSObject:JSON.parse(request.responseText()) recursively:YES];
+                [aRepo.labels addObject:label];
+                [self _noteRepoChanged:aRepo];
+                callback(true);
+                return;
+            }
+            catch (e)
+            {
+                CPLog.error("Created label " + aLabel + " in repository " + aRepo.identifier + " but failed to parse response from server." + e);
+            }
+        }
+        callback(false);
+    };
+
+    request.send(JSON.stringify({name: aLabel, color:[aColor hexString]}));
+}
+
 - (void)label:(CPString)aLabel forIssue:(Issue)anIssue repository:(Repository)aRepo shouldRemove:(BOOL)shouldRemove
 {
-    var request = new CFHTTPRequest(),
-        addOrRemove = shouldRemove ? @"remove" : @"add";
+    var request = new CFHTTPRequest();
 
-    request.open(@"GET", [CPString stringWithFormat:@"%@issues/label/%@/%@/%@/%@%@", BASE_API, addOrRemove, aRepo.identifier, encodeURIComponent(aLabel), [anIssue objectForKey:@"number"], [self _credentialsString]], YES);
+    var labelNames = [anIssue valueForKeyPath:"labels.name"] || [];
+    if ([labelNames count] === 0 && shouldRemove)
+        return;
+
+    if ([aRepo.labels count] === 0)
+    {
+        CPLog.error("No labels configured for repository " + aRepo.identifier);
+        return;
+    }
+
+    if (shouldRemove)
+    {
+        [labelNames removeObject:aLabel];
+    }
+    else
+    {
+        var repoLabels = [aRepo.labels valueForKeyPath:"name"];
+        if ([repoLabels containsObject:aLabel] === NO)
+        {
+            CPLog.error("Label " + aLabel + " not configured for repository " + aRepo.identifier);
+            return;
+        }
+        [labelNames addObject:aLabel];
+    }
+
+    request.open(@"PUT", [self URLForPathComponents:["repos", aRepo.identifier, "issues", [anIssue objectForKey:"number"], "labels"] parameters:nil], true);
+    request.setRequestHeader("Content-Type", "application/json");
 
     request.oncomplete = function()
     {
         [self _checkGithubResponse:request];
-        var labels;
         if (request.success())
         {
             try
             {
                 // returns all the labels for the issue it was assigned to
-                labels = JSON.parse(request.responseText()).labels || [];
+                var labels = [CPArray arrayWithJSArray:(JSON.parse(request.responseText()) || []) recursively:YES];
                 [anIssue setObject:labels forKey:@"labels"];
                 [self _noteIssueChanged:anIssue];
-
-                // now that we know it worked add the label to the repo if it's new
-                if (![aRepo.labels containsObject:aLabel])
-                    aRepo.labels.push(aLabel);
             }
             catch (e)
             {
-                CPLog.error(@"Unable to set labels for issue: " + anIssue + @" -- " + e);
+                CPLog.error(@"Unable to set labels for issue: " + [anIssue objectForKey:"number"] + @" -- " + e);
             }
         }
 
         [[CPRunLoop currentRunLoop] performSelectors];
     };
 
-    request.send(@"");
+    request.send(JSON.stringify(labelNames));
 }
 
 - (void)closeIssue:(id)anIssue repository:(id)aRepo callback:(Function)aCallback
 {
     var request = new CFHTTPRequest();
-    request.open("POST", BASE_API+"issues/close/"+aRepo.identifier+"/"+[anIssue objectForKey:"number"]+[self _credentialsString], true);
+    request.open("PATCH", [self URLForPathComponents:["repos", aRepo.identifier, "issues", [anIssue objectForKey:"number"]] parameters:nil], true);
 
     request.oncomplete = function()
     {
@@ -490,13 +720,13 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
         [[CPRunLoop currentRunLoop] performSelectors];
     }
 
-    request.send("");
+    request.send(JSON.stringify({state: "closed"}));
 }
 
 - (void)reopenIssue:(id)anIssue repository:(id)aRepo callback:(Function)aCallback
 {
     var request = new CFHTTPRequest();
-    request.open("POST", BASE_API+"issues/reopen/"+aRepo.identifier+"/"+[anIssue objectForKey:"number"]+[self _credentialsString], true);
+    request.open("PATCH", [self URLForPathComponents:["repos", aRepo.identifier, "issues", [anIssue objectForKey:"number"]] parameters:nil], true);
 
     request.oncomplete = function()
     {
@@ -518,15 +748,13 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
         [[CPRunLoop currentRunLoop] performSelectors];
     }
 
-    request.send("");
+    request.send(JSON.stringify({state: "open"}));
 }
 
 - (void)openNewIssueWithTitle:(CPString)aTitle body:(CPString)aBody repository:(id)aRepo callback:(Function)aCallback
 {
     var request = new CFHTTPRequest();
-    request.open("POST", BASE_API+"issues/open/"+aRepo.identifier+[self _credentialsString]+
-                                                 "&title="+encodeURIComponent(aTitle)+
-                                                 "&body="+encodeURIComponent(aBody), true);
+    request.open("POST", [self URLForPathComponents:["repos", aRepo.identifier, "issues"] parameters:nil], true);
 
     request.oncomplete = function()
     {
@@ -536,14 +764,9 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
         {
             var issue = nil;
             try {
-                issue = [CPDictionary dictionaryWithJSObject:JSON.parse(request.responseText()).issue];
-                aRepo.openIssues.push(issue);
+                issue = [CPDictionary dictionaryWithJSObject:JSON.parse(request.responseText()) recursively:YES];
+                [aRepo.openIssues addObject:issue];
 
-                if (![issue containsKey:"position"])
-                    [issue setObject:aRepo.minPosition forKey:"position"];
-
-                aRepo.openIssuesMax = MAX([issue objectForKey:"position"], aRepo.openIssuesMax);
-                aRepo.openIssuesMin = MIN([issue objectForKey:"position"], aRepo.openIssuesMin);
                 [self _noteRepoChanged:aRepo];
             }
             catch (e) {
@@ -557,15 +780,14 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
         [[CPRunLoop currentRunLoop] performSelectors];
     }
 
-    request.send("");
+    request.send(JSON.stringify({title: aTitle, body: aBody}));
 }
 
 - (void)addComment:(CPString)commentBody onIssue:(id)anIssue inRepository:(id)aRepo callback:(Function)aCallback
 {
     var request = new CFHTTPRequest();
-    request.open("POST", BASE_API + "issues/comment/"+aRepo.identifier+"/" +
-                [anIssue objectForKey:"number"] + [self _credentialsString] +
-                "&comment="+encodeURIComponent(commentBody), true);
+    request.open("POST", [self URLForPathComponents:["repos", aRepo.identifier, "issues", [anIssue objectForKey:"number"], "comments"] parameters:nil], true);
+    request.setRequestHeader("Content-Type", "application/json");
 
     request.oncomplete = function()
     {
@@ -576,7 +798,7 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
         if (request.success())
         {
             try {
-                comment = JSON.parse(request.responseText()).comment;
+                comment = JSON.parse(request.responseText());
 
                 var comments = [anIssue objectForKey:"all_comments"];
 
@@ -598,16 +820,15 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
             [[CPRunLoop currentRunLoop] performSelectors];
     }
 
-    request.send("");
+    request.send(JSON.stringify({body: commentBody}));
 }
 
 - (void)editIsssue:(Issue)anIssue title:(CPString)aTitle body:(CPString)aBody repository:(id)aRepo callback:(Function)aCallback
 {
     // we've got to make two calls one for the title and one for the body
     var request = new CFHTTPRequest();
-    request.open("POST", BASE_API + "issues/edit/" + aRepo.identifier + "/" + [anIssue objectForKey:"number"] + [self _credentialsString] +
-                                                 "&title=" + encodeURIComponent(aTitle) +
-                                                 "&body=" + encodeURIComponent(aBody), true);
+    request.open("PATCH", [self URLForPathComponents:["repos", aRepo.identifier, "issues", [anIssue objectForKey:"number"]] parameters:nil], true);
+    request.setRequestHeader("Content-Type", "application/json");
 
     request.oncomplete = function()
     {
@@ -617,7 +838,7 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
         {
             var issue = nil;
             try {
-                issue = [CPDictionary dictionaryWithJSObject:JSON.parse(request.responseText()).issue];
+                issue = [CPDictionary dictionaryWithJSObject:JSON.parse(request.responseText())];
 
                 [anIssue setObject:[issue objectForKey:"title"] forKey:"title"];
                 [anIssue setObject:[issue objectForKey:"body"] forKey:"body"];
@@ -636,7 +857,7 @@ CFHTTPRequest.AuthenticationDelegate = function(aRequest)
         [[CPRunLoop currentRunLoop] performSelectors];
     }
 
-    request.send("");
+    request.send(JSON.stringify({title: aTitle, body:aBody}));
 }
 
 /*
@@ -679,6 +900,18 @@ because one day maybe GitHub will give this to me... :)
 
 - (void)_checkGithubResponse:(CFHTTPRequest)aRequest
 {
+    function showAlert(title, messageText, informativeText, style, buttonTitle)
+    {
+        var noteAlert = [[CPAlert alloc] init];
+
+        [noteAlert setTitle:title];
+        [noteAlert setMessageText:messageText];
+        [noteAlert setInformativeText:informativeText];
+        [noteAlert setAlertStyle:style];
+        [noteAlert addButtonWithTitle:buttonTitle];
+        [noteAlert runModal];
+    }
+    // FIXME v3 of the API no longer returns 401, instead it returns 404...
     if (aRequest.status() === 401)
     {
         try
@@ -710,15 +943,30 @@ because one day maybe GitHub will give this to me... :)
             }
         }catch(e){}
     }
+    // 400 and 422 are currently the only statuses documented in the API
+    else if (aRequest.status() === 404 || aRequest.status() === 400 || aRequest.status() === 422)
+    {
+        var error = nil;
+        try
+        {
+            error = JSON.parse(aRequest.responseText()).message;
+        } catch (e)
+        {
+            error = aRequest.responseText();
+        }
+        showAlert("Error",
+                "Error",
+                "An error occurred while accessing the GitHub API. GitHub error:" + error,
+                CPWarningAlertStyle,
+                "Okay");
+    }
     else if (aRequest.status() === 503)
     {
-        var noteAlert = [[CPAlert alloc] init];
-
-        [noteAlert setTitle:"Service Unavailable"];
-        [noteAlert setMessageText:"Service Unavailable"];
-        [noteAlert setInformativeText:"It appears the GitHub API is down at the moment. Check back in a few minutes to see if it is back online."];
-        [noteAlert setAlertStyle:CPWarningAlertStyle];
-        [noteAlert addButtonWithTitle:"Okay"];
+        showAlert("Service Unavailable",
+                "Service Unavailable",
+                "It appears the GitHub API is down at the moment. Check back in a few minutes to see if it is back online.",
+                CPWarningAlertStyle,
+                "Okay");
     }
 }
 
@@ -770,3 +1018,31 @@ GitHubAPI = {
     return CPOrderedAscending;
 }
 @end
+
+@implementation CPArray (WithJSArray)
++ (CPArray)arrayWithJSArray:(id)jsArray recursively:(id)recursively
+{
+    if (jsArray == nil)
+    {
+        return nil;
+    }
+    if (recursively === false)
+    {
+        return [CPArray arrayWithArray:jsArray];
+    }
+
+    var cpArray = [[CPArray alloc] init];
+    for (var i = 0; i < jsArray.length; i++)
+    {
+        var value = jsArray[i];
+        if (value.constructor === Object)
+        {
+            [cpArray addObject:[CPDictionary dictionaryWithJSObject:value recursively:recursively]];
+        }
+        else if ([value isKindOfClass:CPArray])
+        {
+            [cpArray addObject:[CPArray arrayWithJSArray:value recursively:recursively]];
+        }
+    }
+    return cpArray;
+}

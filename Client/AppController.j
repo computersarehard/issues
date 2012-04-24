@@ -237,7 +237,7 @@ APPLICATION_VERSION_NUMBER = 1.8;
 
 - (void)applicationWillTerminate:(CPNotification)aNote
 {
-    [[[CPCookie alloc] initWithName:@"github.repos"] setValue:encodeURIComponent(JSON.stringify([reposController sortedRepos], ["name", "owner", "identifier", "open_issues", "description", "private"]))
+    [[[CPCookie alloc] initWithName:@"github.repos"] setValue:encodeURIComponent(JSON.stringify([reposController sortedRepos], ["name", "owner", "login", "identifier", "open_issues", "description", "private"]))
                                                       expires:[CPDate dateWithTimeIntervalSinceNow:31536000]
                                                        domain:nil];
 

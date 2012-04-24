@@ -73,9 +73,13 @@ var IssuesHTMLTemplate = nil;
             [issue setObject:"" forKey:"body_html"];            
         }
 
+        var user = [issue objectForKey:"user"];
+        [issue setObject:[user objectForKey:"gravatar_id"] forKey:"gravatar_id"];
+        [issue setObject:[user objectForKey:"login"] forKey:"user_login"];
         [issue setObject:[CPDate simpleDate:[issue objectForKey:"created_at"]] forKey:"human_readable_created_date"];
         [issue setObject:[CPDate simpleDate:[issue objectForKey:"updated_at"]] forKey:"human_readable_updated_date"];
-        [issue setObject:([issue objectForKey:"labels"] || []).join(", ") forKey:"comma_separated_tags"];
+        var labels = ([issue objectForKey:"labels"] || []);
+        [issue setObject:[labels valueForKeyPath:"name"].join(", ") forKey:"comma_separated_tags"];
         [issue setObject:BASE_URL forKey:"pref_base_url"];
 
         if (repo)
@@ -149,14 +153,6 @@ var IssuesHTMLTemplate = nil;
 
     if (scrollRect)
         [_frameView scrollRectToVisible:scrollRect];
-
-    domWindow.showPullRequest = function()
-    {
-        var controller = [[PullRequestWindowController alloc] initWithWindowCibName:"PullRequestWindow"];
-
-        [controller showWindow:self];
-        [controller setPullRequest:repo.pullRequests[[issue objectForKey:"number"]]];
-    }
 }
 
 @end

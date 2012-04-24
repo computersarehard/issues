@@ -69,8 +69,15 @@
 
 - (@action)submit:(id)aSender
 {
-    [sender setTagForSelectedIssue:[nameField stringValue]];
-    [_window performClose:aSender];
+    var newLabel = [nameField stringValue];
+    [[GithubAPIController sharedController] createLabel:newLabel withColor:[CPColor blackColor] repository:sender.repo callback:function (success)
+    {
+        if (success)
+        {
+            [sender setTagForSelectedIssue:newLabel];
+            [_window performClose:aSender];
+        }
+    }];
 }
 
 @end

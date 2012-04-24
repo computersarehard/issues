@@ -157,8 +157,8 @@
 
     [issuesTableView addTableColumn:priority];
 
-    var desc = [CPSortDescriptor sortDescriptorWithKey:@"user" ascending:YES],
-        creator = [[CPTableColumn alloc] initWithIdentifier:"user"];
+    var desc = [CPSortDescriptor sortDescriptorWithKey:@"user.login" ascending:YES],
+        creator = [[CPTableColumn alloc] initWithIdentifier:"user.login"];
 
     [[creator headerView] setStringValue:"Creator"];
     [creator setWidth:120.0];
@@ -235,7 +235,7 @@
         return;
 
     [self selectIssueAtIndex:-1];
-    [issuesTableView reloadData];
+    [self loadIssues];
 
     [self searchFieldDidChange:nil];
 }
@@ -550,17 +550,23 @@
 
     _ephemeralSelectedIssue = [issue objectForKey:"repo_identifier"] + "---" + [issue objectForKey:"number"];
 
-    delete repo.openIssues;
-    delete repo.closedIssues;
+    delete repo[displayedIssuesKey];
     [self loadIssues];
 }
 
 - (void)loadIssues
 {
-    if (repo.openIssues && repo.closedIssues)
+    if (repo[displayedIssuesKey])
         return;
 
-    [[GithubAPIController sharedController] loadIssuesForRepository:repo callback:function(success)
+    var state = null;
+    if (displayedIssuesKey == "openIssues")
+        state = "open";
+    else
+        state = "closed";
+
+    [self showView:loadingIssuesView];
+    [[GithubAPIController sharedController] loadIssuesInState:state forRepository:repo callback:function(success)
     {
         [issuesTableView reloadData];
         [self showView:nil];
@@ -604,7 +610,7 @@
 
     if (repo)
     {
-        if (repo.openIssues && repo.closedIssues)
+        if (repo[displayedIssuesKey])
         {
             [issuesTableView selectRowIndexes:[CPIndexSet indexSet] byExtendingSelection:NO];
             [self showView:nil];
@@ -612,7 +618,6 @@
         }
         else
         {
-            [self showView:loadingIssuesView];
             [self loadIssues];
         }
     }
@@ -724,7 +729,7 @@
             [issueWebView setRepo:repo];
             [issueWebView loadIssue];
 
-            [CPApp setArguments:[repo.owner, repo.name, [item objectForKey:"number"]]];
+            [CPApp setArguments:[repo.owner.login, repo.name, [item objectForKey:"number"]]];
         }
     }
     else
@@ -765,6 +770,10 @@
     }
     else if (columnIdentifier === "pull")
         value = [issue objectForKey:"has_pull_request"] ? _cachedHasPullRequestsImage : nil;
+    else if (columnIdentifier === "user.login")
+    {
+        value = [issue valueForKeyPath:"user.login"];
+    }
 
 
     return value;
@@ -931,7 +940,7 @@
 {
     // go ahead and set the value
     var issue = [(filteredIssues || repo[displayedIssuesKey]) objectAtIndex:row],
-        curr = [issue objectValueForKey:"title"];
+        curr = [issue objectForKey:"title"];
 
     // Dont update if there's nothing to change...
     if (curr === aValue)
@@ -972,8 +981,8 @@
                 continue;
             }
 
-            if ((searchFilter === IssuesFilterAll || searchFilter === IssuesFilterCreator) && [item valueForKey:@"user"] !== [CPNull null] &&
-                [[item valueForKey:@"user"] lowercaseString].match(searchString))
+            if ((searchFilter === IssuesFilterAll || searchFilter === IssuesFilterCreator) && [item valueForKeyPath:@"user.login"] !== [CPNull null] &&
+                [[item valueForKeyPath:@"user.login"] lowercaseString].match(searchString))
             {
                 [filteredIssues addObject:[theIssues objectAtIndex:i]];
                 continue;
@@ -1055,12 +1064,12 @@
 - (CPArray)tagsForSelectedIssue
 {
     var items = [],
-        issuesLabels = [[self selectedIssue] objectForKey:@"labels"],
+        issuesLabels = [[self selectedIssue] valueForKeyPath:@"labels.name"],
         repoLabelCount = [repo.labels count];
 
     for (var i = 0; i < repoLabelCount; i++)
     {
-        var currentLabel = repo.labels[i],
+        var currentLabel = [repo.labels[i] objectForKey:"name"],
             newItem = {label: currentLabel, isUsed: [issuesLabels containsObject:currentLabel]};
 
         items.push(newItem);

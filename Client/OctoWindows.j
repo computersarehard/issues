@@ -63,8 +63,33 @@ var SharedLoginWindow = nil;
 {
     SharedLoginWindow = self;
     [super awakeFromCib];
-    
-    [apiTokenHelpButton setBordered:NO];
+
+    var passwordField = [[CPSecureTextField alloc] initWithFrame:[apiTokenField frame]];
+    [passwordField setEditable:YES];
+    [passwordField setBordered:YES];
+    [passwordField setBezeled:YES];
+    [[CPNotificationCenter defaultCenter] addObserver:self selector:@selector(controlTextDidChange:) name:CPControlTextDidChangeNotification object:passwordField];
+
+    [usernameField setNextKeyView:passwordField];
+    [passwordField setNextKeyView:defaultButton];
+
+    [[CPNotificationCenter defaultCenter] removeObserver:apiTokenField];
+    [[apiTokenField superview] replaceSubview:apiTokenField with:passwordField];
+
+    apiTokenField = passwordField;
+
+    [apiTokenHelpButton removeFromSuperview];
+    apiTokenHelpButton = nil;
+
+    var views = [[apiTokenField superview] subviews];
+    for (var i = 0; i < [views count]; i++) {
+        var view = [views objectAtIndex:i];
+        if ([view isKindOfClass:CPTextField] && [view stringValue] === "API Token:")
+        {
+            [view setStringValue:"Password:"];
+            break;
+        }
+    }
 }
 
 - (@action)openAPIKeyPage:(id)sender
@@ -84,23 +109,37 @@ var SharedLoginWindow = nil;
 
 - (@action)login:(id)sender
 {
+    var password = [apiTokenField stringValue];
+    [apiTokenField setStringValue:""];
+
     var githubController = [GithubAPIController sharedController];
     [githubController setUsername:[[self usernameField] stringValue]];
-    [githubController setAuthenticationToken:[[self apiTokenField] stringValue]];
-
-    [githubController authenticateWithCallback:function(success)
+    [githubController createOrLookupAccessTokenWithPassword:password callback:function(success)
     {
-        [progressIndicator setHidden:YES];
-        [errorMessageField setHidden:success];
-        [defaultButton setEnabled:YES];
-        [cancelButton setEnabled:YES];
-
-        if (success)
+        if (!success)
         {
-            [[[NewRepoWindow sharedNewRepoWindow] errorMessageField] setHidden:YES];
-            [self orderOut:self];
+            [progressIndicator setHidden:YES];
+            [errorMessageField setHidden:NO];
+            [defaultButton setEnabled:YES];
+            [cancelButton setEnabled:YES];
+            return;
         }
+
+        [githubController authenticateWithCallback:function(success)
+        {
+            [progressIndicator setHidden:YES];
+            [errorMessageField setHidden:success];
+            [defaultButton setEnabled:YES];
+            [cancelButton setEnabled:YES];
+
+            if (success)
+            {
+                [[[NewRepoWindow sharedNewRepoWindow] errorMessageField] setHidden:YES];
+                [self orderOut:self];
+            }
+        }];
     }];
+
     
     [errorMessageField setHidden:YES];
     [progressIndicator setHidden:NO];

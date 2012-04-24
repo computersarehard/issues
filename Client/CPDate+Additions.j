@@ -48,7 +48,8 @@
     if(!aDate)
         return;
 
-    aDate = [aDate stringByReplacingOccurrencesOfString:@"/" withString:@"-"];
+    aDate = [aDate stringByReplacingOccurrencesOfString:@"T" withString:@" "];
+    aDate = [aDate stringByReplacingOccurrencesOfString:@"Z" withString:@" +0000"];
     aDate = [[CPDate alloc] initWithString:aDate];
 
     return [aDate simpleDate];
